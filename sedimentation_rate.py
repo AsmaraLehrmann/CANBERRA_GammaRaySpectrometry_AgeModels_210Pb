@@ -11,11 +11,18 @@ If no path is given, a file-picker dialog opens.
 Workflow:
     1. The script opens an interactive plot window showing the age model
        (Excess Pb-210 vs depth, plus background activity).
-    2. Click TWO points on the plot. Only the y-coordinate (depth) is used;
-       each click is snapped to the nearest interval with a valid calendar year.
-    3. The sedimentation rate (cm/yr) is computed and shown on the plot.
-    4. Close the window; the script asks whether to compute another pair.
-    5. When you stop, every pair is written to
+    2. Click TWO points on the plot to set the DEPTH RANGE for a segment.
+       Only the y-coordinate (depth) is used; each click is snapped to the
+       nearest interval with a valid calendar year.
+    3. Every dated point that falls within that range (not just the two you
+       clicked) is fit with an ordinary least-squares regression of depth
+       vs. calendar year. The sedimentation rate (cm/yr) is the (sign-
+       corrected) slope of that fit, along with its standard error and R^2.
+    4. A second window shows the fit itself (year vs depth, points + line)
+       so you can check the regression before accepting it.
+    5. Close both windows; the script asks whether to compute another
+       segment.
+    6. When you stop, every segment is written to
            <input_dir>/<input_basename>_SedimentationRates_<YYYYMMDD>.csv
 """
 
@@ -71,8 +78,8 @@ def load_age_model(csv_path: Path) -> pd.DataFrame:
     return df
 
 
-def draw_age_model(ax, data: pd.DataFrame, core_name: str, pair_index: int,
-                   previous_pairs: list[dict]) -> None:
+def draw_age_model(ax, data: pd.DataFrame, core_name: str, seg_index: int,
+                   previous_segments: list[dict]) -> None:
     valid_excess = ~data["Excess Pb-210 (Bq/g)"].isna()
     ax.plot(
         data.loc[valid_excess, "Excess Pb-210 (Bq/g)"],
@@ -104,8 +111,8 @@ def draw_age_model(ax, data: pd.DataFrame, core_name: str, pair_index: int,
         capsize=5, linewidth=1, ecolor="darkgrey",
     )
 
-    # Faded overlay of previously calculated pairs for context
-    for prev in previous_pairs:
+    # Faded overlay of previously fit segments for context
+    for prev in previous_segments:
         ax.plot(
             [prev["shallow_excess_pb210"], prev["deep_excess_pb210"]],
             [prev["shallow_depth_cm"],    prev["deep_depth_cm"]],
@@ -118,7 +125,7 @@ def draw_age_model(ax, data: pd.DataFrame, core_name: str, pair_index: int,
     ax.set_xlabel("Bq/g", fontsize=12)
     ax.set_ylabel("Depth (cm)", fontsize=12)
     ax.set_title(
-        f"{core_name} - Click TWO points (pair #{pair_index})\n"
+        f"{core_name} - Click TWO points to set the range (segment #{seg_index})\n"
         f"close the window when finished",
         fontsize=12,
     )
@@ -138,14 +145,53 @@ def snap_to_nearest(lookup: pd.DataFrame, depth_click: float) -> tuple[float, fl
     )
 
 
-def calculate_one_pair(data: pd.DataFrame, lookup: pd.DataFrame, core_name: str,
-                       pair_index: int, previous_pairs: list[dict]) -> dict | None:
+def get_points_in_range(lookup: pd.DataFrame, d_min: float, d_max: float) -> pd.DataFrame:
+    """All dated rows with depth in [d_min, d_max], sorted shallow -> deep."""
+    mask = (lookup["Center point of interval"] >= d_min) & \
+           (lookup["Center point of interval"] <= d_max)
+    return lookup.loc[mask].sort_values("Center point of interval").reset_index(drop=True)
+
+
+def fit_linear_regression(x: np.ndarray, y: np.ndarray) -> dict:
+    """
+    Ordinary least-squares fit of y as a function of x (numpy only, no
+    scipy dependency). Returns slope, intercept, R^2, the standard error
+    of the slope, and n. Standard error is NaN when n <= 2 (no residual
+    degrees of freedom) or when x has zero variance.
+    """
+    n = len(x)
+    slope, intercept = np.polyfit(x, y, 1)
+    y_pred = slope * x + intercept
+    residuals = y - y_pred
+    ss_res = np.sum(residuals ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    sxx = np.sum((x - np.mean(x)) ** 2)
+    if n > 2 and sxx > 0:
+        mse = ss_res / (n - 2)
+        std_err = np.sqrt(mse / sxx)
+    else:
+        std_err = float("nan")
+
+    return {"slope": slope, "intercept": intercept, "r_squared": r_squared,
+            "std_err": std_err, "n": n}
+
+
+def _fmt_rate(rate: float, std_err: float) -> str:
+    if np.isnan(std_err):
+        return f"{rate:.4f} cm/yr"
+    return f"{rate:.4f} \u00b1 {std_err:.4f} cm/yr"
+
+
+def calculate_one_segment(data: pd.DataFrame, lookup: pd.DataFrame, core_name: str,
+                          seg_index: int, previous_segments: list[dict]) -> dict | None:
     fig, ax = plt.subplots(figsize=(6, 9))
-    draw_age_model(ax, data, core_name, pair_index, previous_pairs)
+    draw_age_model(ax, data, core_name, seg_index, previous_segments)
     fig.tight_layout()
 
-    print(f"\nPair #{pair_index}: click TWO points in the popup window "
-          f"(only depth matters; x is ignored).")
+    print(f"\nSegment #{seg_index}: click TWO points to set the depth range "
+          f"for the regression (only depth matters; x is ignored).")
     pts = plt.ginput(2, timeout=0, show_clicks=True)
 
     if len(pts) < 2:
@@ -153,60 +199,93 @@ def calculate_one_pair(data: pd.DataFrame, lookup: pd.DataFrame, core_name: str,
         plt.close(fig)
         return None
 
-    d1, y1, x1 = snap_to_nearest(lookup, pts[0][1])
-    d2, y2, x2 = snap_to_nearest(lookup, pts[1][1])
-
-    # Order shallow -> deep
+    d1, _, _ = snap_to_nearest(lookup, pts[0][1])
+    d2, _, _ = snap_to_nearest(lookup, pts[1][1])
     if d1 > d2:
         d1, d2 = d2, d1
-        y1, y2 = y2, y1
-        x1, x2 = x2, x1
 
-    delta_depth = d2 - d1
-    delta_years = y1 - y2  # shallower year (more recent) - deeper year (older)
-    if delta_depth == 0 or delta_years == 0:
-        print(f"Selected points collapse to a single interval "
-              f"(Δdepth={delta_depth}, Δyears={delta_years}); cannot compute a rate.")
+    subset = get_points_in_range(lookup, d1, d2)
+    if len(subset) < 2:
+        print(f"Only {len(subset)} dated point(s) fall between {d1:.2f} and "
+              f"{d2:.2f} cm; need at least 2 to fit a line. Skipping.")
         plt.close(fig)
         return None
+    if len(np.unique(subset["calendar years pre year of core"])) < 2:
+        print("All points in range share the same calendar year; "
+              "cannot fit a slope. Skipping.")
+        plt.close(fig)
+        return None
+    if len(subset) == 2:
+        print("Only 2 dated points in range: this reduces to the old "
+              "point-to-point calculation, with no uncertainty estimate.")
 
-    rate = delta_depth / delta_years
+    years = subset["calendar years pre year of core"].to_numpy(dtype=float)
+    depths = subset["Center point of interval"].to_numpy(dtype=float)
 
-    # Mark the selected segment, then keep the window open until the user closes it
-    ax.plot([x1, x2], [d1, d2], "ro-", markersize=10, linewidth=2,
-            label=f"Pair #{pair_index}: {rate:.4f} cm/yr")
+    fit = fit_linear_regression(years, depths)
+    # Depth is regressed on calendar year, but calendar year decreases with
+    # depth (older = smaller year), so the raw slope is negative. Flip the
+    # sign so a normal (deeper = older) profile reports a positive rate,
+    # matching the old delta_depth / delta_years convention.
+    rate = -fit["slope"]
+    std_err_rate = fit["std_err"]  # magnitude is unaffected by the sign flip
+
+    # Highlight every point actually used in the regression
+    ax.plot(
+        subset["Excess Pb-210 (Bq/g)"], subset["Center point of interval"],
+        "ro", markersize=9, zorder=3,
+        label=f"Segment #{seg_index}: n={fit['n']}, {rate:.4f} cm/yr",
+    )
     ax.set_title(
-        f"{core_name} - pair #{pair_index}: {rate:.4f} cm/yr\n"
-        f"close this window to continue",
-        fontsize=12,
+        f"{core_name} - segment #{seg_index}: {_fmt_rate(rate, std_err_rate)} "
+        f"(R\u00b2={fit['r_squared']:.3f}, n={fit['n']})\n"
+        f"close both windows to continue",
+        fontsize=11,
     )
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), fontsize=9)
     fig.canvas.draw()
 
-    print(f"  shallow: depth = {d1:.2f} cm, year = {y1:.1f}")
-    print(f"  deep:    depth = {d2:.2f} cm, year = {y2:.1f}")
-    print(f"  Δdepth = {delta_depth:.2f} cm,  Δyears = {delta_years:.2f} yr")
-    print(f"  >>> Sedimentation rate = {rate:.4f} cm/yr  ({1/rate:.2f} yr/cm)")
+    # Diagnostic plot: calendar year vs depth, with the fitted line, so the
+    # fit quality is visible before you accept the segment.
+    fig2, ax2 = plt.subplots(figsize=(5, 4))
+    ax2.scatter(years, depths, color="black", zorder=3, label="Dated points")
+    year_line = np.linspace(years.min(), years.max(), 50)
+    depth_line = fit["slope"] * year_line + fit["intercept"]
+    ax2.plot(year_line, depth_line, color="red", linewidth=1.5, label="OLS fit")
+    ax2.invert_yaxis()
+    ax2.set_xlabel("Calendar year", fontsize=10)
+    ax2.set_ylabel("Depth (cm)", fontsize=10)
+    ax2.set_title(
+        f"Segment #{seg_index} regression\n"
+        f"rate = {_fmt_rate(rate, std_err_rate)}, R\u00b2 = {fit['r_squared']:.3f}",
+        fontsize=10,
+    )
+    ax2.legend(fontsize=8)
+    fig2.tight_layout()
 
-    plt.show()  # blocks until the user closes the window
+    print(f"  depth range: {d1:.2f}-{d2:.2f} cm, {fit['n']} dated point(s) used")
+    print(f"  >>> Sedimentation rate = {_fmt_rate(rate, std_err_rate)} "
+          f"(R\u00b2 = {fit['r_squared']:.3f})")
+
+    plt.show()  # blocks until both windows are closed
 
     return {
-        "pair_index": pair_index,
+        "segment_index": seg_index,
         "shallow_depth_cm": d1,
-        "shallow_year": y1,
-        "shallow_excess_pb210": x1,
         "deep_depth_cm": d2,
-        "deep_year": y2,
-        "deep_excess_pb210": x2,
-        "delta_depth_cm": delta_depth,
-        "delta_years": delta_years,
+        "n_points": fit["n"],
         "sedimentation_rate_cm_per_yr": rate,
+        "rate_std_err_cm_per_yr": std_err_rate,
+        "r_squared": fit["r_squared"],
+        "shallow_excess_pb210": subset["Excess Pb-210 (Bq/g)"].iloc[0],
+        "deep_excess_pb210": subset["Excess Pb-210 (Bq/g)"].iloc[-1],
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Interactive sedimentation rate calculator (popup-based)."
+        description="Interactive sedimentation rate calculator (popup-based, "
+                     "regression over a clicked depth range)."
     )
     parser.add_argument(
         "csv", nargs="?", type=Path,
@@ -247,13 +326,13 @@ def main() -> int:
 
     core_name = args.core or csv_path.stem
     results: list[dict] = []
-    pair_n = 1
+    seg_n = 1
 
     while True:
-        result = calculate_one_pair(data, lookup, core_name, pair_n, results)
+        result = calculate_one_segment(data, lookup, core_name, seg_n, results)
         if result is not None:
             results.append(result)
-            pair_n += 1
+            seg_n += 1
         again = input("\nCalculate another sedimentation rate? (yes/no): ").strip().lower()
         if again not in ("y", "yes"):
             break
@@ -263,7 +342,7 @@ def main() -> int:
         date_tag = datetime.today().strftime("%Y%m%d")
         out_path = csv_path.with_name(f"{csv_path.stem}_SedimentationRates_{date_tag}.csv")
         df.to_csv(out_path, index=False)
-        print(f"\nSaved {len(df)} pair(s) -> {out_path}")
+        print(f"\nSaved {len(df)} segment(s) -> {out_path}")
         print(df.to_string(index=False))
     else:
         print("\nNo sedimentation rates were calculated. Nothing saved.")
